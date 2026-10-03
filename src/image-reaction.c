@@ -11,6 +11,7 @@
 #include <util/dstr.h>
 #include <sys/stat.h>
 #include <media-io/audio-math.h>
+#include <math.h>
 
 #define blog(log_level, format, ...)                             \
 	blog(log_level, "[image_reaction_source: '%s'] " format, \
@@ -19,6 +20,19 @@
 #define debug(format, ...) blog(LOG_DEBUG, format, ##__VA_ARGS__)
 #define info(format, ...) blog(LOG_INFO, format, ##__VA_ARGS__)
 #define warn(format, ...) blog(LOG_WARNING, format, ##__VA_ARGS__)
+
+enum state_effect {
+	EFFECT_NONE,
+	EFFECT_VIBE,
+	EFFECT_DRIFT,
+	EFFECT_SHAKE,
+};
+
+struct state_effect_settings {
+	enum state_effect type;
+	float intensity;
+	float speed;
+};
 
 struct image_reaction_source {
 	obs_source_t *source;
@@ -47,6 +61,15 @@ struct image_reaction_source {
 	bool animReset2;
 	bool loudOld;
 	bool animResetTrigger;
+
+	/* index 0 - silence, index 1 - sound */
+	struct state_effect_settings effects[2];
+	float effect_time;
+	float shake_timer;
+	uint32_t shake_seed;
+	float offset_x;
+	float offset_y;
+	uint32_t padding;
 };
 
 /*int MAX(int a, int b) {
@@ -129,6 +152,17 @@ static void audio_capture(void *param, obs_source_t *src,
 		context->animResetTrigger = true;
 }
 
+static enum state_effect effect_from_string(const char *name)
+{
+	if (strcmp(name, "vibe") == 0)
+		return EFFECT_VIBE;
+	if (strcmp(name, "drift") == 0)
+		return EFFECT_DRIFT;
+	if (strcmp(name, "shake") == 0)
+		return EFFECT_SHAKE;
+	return EFFECT_NONE;
+}
+
 static void image_reaction_source_update(void *data, obs_data_t *settings)
 {
 	struct image_reaction_source *context = data;
@@ -156,6 +190,29 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 	context->linear_alpha = linear_alpha;
 	context->threshold = db_to_mul((float)threshold);
 	context->smoothness = (float)pow(0.1, smoothness);
+
+	context->effects[0].type =
+		effect_from_string(obs_data_get_string(settings, "effect_1"));
+	context->effects[0].intensity =
+		(float)obs_data_get_double(settings, "effect_intensity_1");
+	context->effects[0].speed =
+		(float)obs_data_get_double(settings, "effect_speed_1");
+	context->effects[1].type =
+		effect_from_string(obs_data_get_string(settings, "effect_2"));
+	context->effects[1].intensity =
+		(float)obs_data_get_double(settings, "effect_intensity_2");
+	context->effects[1].speed =
+		(float)obs_data_get_double(settings, "effect_speed_2");
+
+	/* Pad the source by the largest movement so that the image is not
+	 * clipped when it moves. Padding is the same for both states to keep
+	 * the source size stable. */
+	float padding = 0.0f;
+	for (int i = 0; i <= 1; i++) {
+		if (context->effects[i].type != EFFECT_NONE)
+			padding = MAX(padding, context->effects[i].intensity);
+	}
+	context->padding = (uint32_t)ceilf(padding);
 
 	/* Load the image if the source is persistent or showing */
 	if (context->persistent || obs_source_showing(context->source))
@@ -207,6 +264,12 @@ static void image_reaction_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "audio_source", "");
 	obs_data_set_default_double(settings, "threshold", -40.0f);
 	obs_data_set_default_double(settings, "smoothness", 1.0f);
+	obs_data_set_default_string(settings, "effect_1", "none");
+	obs_data_set_default_double(settings, "effect_intensity_1", 10.0);
+	obs_data_set_default_double(settings, "effect_speed_1", 1.0);
+	obs_data_set_default_string(settings, "effect_2", "none");
+	obs_data_set_default_double(settings, "effect_intensity_2", 10.0);
+	obs_data_set_default_double(settings, "effect_speed_2", 1.0);
 }
 
 static void image_reaction_source_show(void *data)
@@ -279,15 +342,17 @@ static void image_reaction_source_destroy(void *data)
 static uint32_t image_reaction_source_getwidth(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if31.image2.image.cx,
-		   context->if32.image2.image.cx);
+	uint32_t cx = MAX(context->if31.image2.image.cx,
+			  context->if32.image2.image.cx);
+	return cx ? cx + context->padding * 2 : 0;
 }
 
 static uint32_t image_reaction_source_getheight(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if31.image2.image.cy,
-		   context->if32.image2.image.cy);
+	uint32_t cy = MAX(context->if31.image2.image.cy,
+			  context->if32.image2.image.cy);
+	return cy ? cy + context->padding * 2 : 0;
 }
 
 static void image_reaction_source_render(void *data, gs_effect_t *effect)
@@ -305,8 +370,13 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 			gs_effect_get_param_by_name(effect, "image");
 		gs_effect_set_texture_srgb(param, if3->image2.image.texture);
 
+		gs_matrix_push();
+		gs_matrix_translate3f((float)context->padding + context->offset_x,
+				      (float)context->padding + context->offset_y,
+				      0.0f);
 		gs_draw_sprite(if3->image2.image.texture, 0,
 			       if3->image2.image.cx, if3->image2.image.cy);
+		gs_matrix_pop();
 	}
 	//context->loud = false;
 
@@ -315,10 +385,57 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 	gs_enable_framebuffer_srgb(previous);
 }
 
+static float shake_random(struct image_reaction_source *context)
+{
+	context->shake_seed = context->shake_seed * 1664525u + 1013904223u;
+	return (float)(context->shake_seed >> 8) / 8388608.0f - 1.0f;
+}
+
+static void image_reaction_update_effect(struct image_reaction_source *context,
+					 float seconds)
+{
+	const struct state_effect_settings *effect =
+		&context->effects[context->loud ? 1 : 0];
+	const float intensity = effect->intensity;
+
+	context->effect_time += seconds * effect->speed;
+	if (context->effect_time > 3600.0f)
+		context->effect_time -= 3600.0f;
+	const float t = context->effect_time * 2.0f * (float)M_PI;
+
+	switch (effect->type) {
+	case EFFECT_VIBE:
+		/* rhythmic bob with a slight sway */
+		context->offset_x = intensity * 0.35f * sinf(t);
+		context->offset_y = intensity * sinf(t * 2.0f);
+		break;
+	case EFFECT_DRIFT:
+		/* slow wandering, sines with unrelated periods */
+		context->offset_x = intensity * (0.6f * sinf(t * 0.17f) +
+						 0.4f * sinf(t * 0.41f + 1.3f));
+		context->offset_y = intensity * (0.6f * sinf(t * 0.23f + 2.1f) +
+						 0.4f * sinf(t * 0.13f + 0.7f));
+		break;
+	case EFFECT_SHAKE:
+		/* new random position 30 times per second */
+		context->shake_timer += seconds * effect->speed;
+		if (context->shake_timer >= 1.0f / 30.0f) {
+			context->shake_timer = 0.0f;
+			context->offset_x = intensity * shake_random(context);
+			context->offset_y = intensity * shake_random(context);
+		}
+		break;
+	default:
+		context->offset_x = 0.0f;
+		context->offset_y = 0.0f;
+	}
+}
+
 static void image_reaction_tick(void *data, float seconds)
 {
 	struct image_reaction_source *context = data;
-	UNUSED_PARAMETER(seconds);
+
+	image_reaction_update_effect(context, seconds);
 
 	// Update / refresh audio capturing
 	char *new_name = NULL;
@@ -449,6 +566,54 @@ static bool source_changed(obs_properties_t *props, obs_property_t *prop,
 	return true;
 }
 
+static bool effect_changed(obs_properties_t *props, obs_property_t *prop,
+			   obs_data_t *settings)
+{
+	UNUSED_PARAMETER(prop);
+
+	const bool enabled1 = effect_from_string(obs_data_get_string(
+				      settings, "effect_1")) != EFFECT_NONE;
+	const bool enabled2 = effect_from_string(obs_data_get_string(
+				      settings, "effect_2")) != EFFECT_NONE;
+
+	obs_property_set_visible(
+		obs_properties_get(props, "effect_intensity_1"), enabled1);
+	obs_property_set_visible(obs_properties_get(props, "effect_speed_1"),
+				 enabled1);
+	obs_property_set_visible(
+		obs_properties_get(props, "effect_intensity_2"), enabled2);
+	obs_property_set_visible(obs_properties_get(props, "effect_speed_2"),
+				 enabled2);
+	return true;
+}
+
+static void add_effect_properties(obs_properties_t *props, const char *effect,
+				  const char *effect_text,
+				  const char *intensity, const char *speed)
+{
+	obs_property_t *p = obs_properties_add_list(props, effect,
+						    obs_module_text(effect_text),
+						    OBS_COMBO_TYPE_LIST,
+						    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Effect.None"), "none");
+	obs_property_list_add_string(p, obs_module_text("Effect.Vibe"), "vibe");
+	obs_property_list_add_string(p, obs_module_text("Effect.Drift"),
+				     "drift");
+	obs_property_list_add_string(p, obs_module_text("Effect.Shake"),
+				     "shake");
+	obs_property_set_modified_callback(p, effect_changed);
+
+	p = obs_properties_add_float_slider(props, intensity,
+					    obs_module_text("EffectIntensity"),
+					    1.0, 100.0, 1.0);
+	obs_property_float_set_suffix(p, " px");
+
+	p = obs_properties_add_float_slider(props, speed,
+					    obs_module_text("EffectSpeed"), 0.1,
+					    5.0, 0.1);
+	obs_property_float_set_suffix(p, "x");
+}
+
 static obs_properties_t *image_reaction_source_properties(void *data)
 {
 	struct image_reaction_source *s = data;
@@ -470,10 +635,14 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 				OBS_PATH_FILE, image_filter, path.array);
 	obs_properties_add_bool(props, "anim_reset_1",
 				obs_module_text("AnimReset1"));
+	add_effect_properties(props, "effect_1", "Effect1",
+			      "effect_intensity_1", "effect_speed_1");
 	obs_properties_add_path(props, "file2", obs_module_text("Reaction2"),
 				OBS_PATH_FILE, image_filter, path.array);
 	obs_properties_add_bool(props, "anim_reset_2",
 				obs_module_text("AnimReset2"));
+	add_effect_properties(props, "effect_2", "Effect2",
+			      "effect_intensity_2", "effect_speed_2");
 	dstr_free(&path);
 
 	obs_properties_add_bool(props, "unload",

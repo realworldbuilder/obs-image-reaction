@@ -1,6 +1,20 @@
 # OBS Image Reaction Plugin
 Image that reacts to sound source.
 
+## State Effects
+Each state (silence / sound) can have an optional movement effect, similar to the state effects in veadotube:
+- **Vibe** - rhythmic bob with a slight sway
+- **Drift** - slow wandering
+- **Shake** - fast random jitter
+
+Each effect has an intensity (in pixels) and a speed. When an effect is enabled the source is padded by the largest intensity so that the image is not clipped while it moves.
+
+## Quick Local Build (macOS)
+Builds against the OBS Studio installed in `/Applications` (only the libobs headers are downloaded) and installs the plugin for the current user:
+```shell
+./build-macos-local.sh --install
+```
+
 ## Install Plugin
 1. Go to the releases page for this repo.
 2. Select the appropriate package installer for your operating system.
