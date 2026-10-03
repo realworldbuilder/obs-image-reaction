@@ -34,18 +34,22 @@ struct state_effect_settings {
 	float speed;
 };
 
+/* images: silence, sound, silence while blinking, sound while blinking */
+#define IMAGE_COUNT 4
+
+static const char *file_settings[IMAGE_COUNT] = {"file1", "file2",
+						 "file1_blink", "file2_blink"};
+
 struct image_reaction_source {
 	obs_source_t *source;
 	char source_name[255];
 
-	char *file1;
-	char *file2;
+	char *files[IMAGE_COUNT];
 	bool persistent;
 	bool linear_alpha;
 	bool active;
 
-	gs_image_file3_t if31;
-	gs_image_file3_t if32;
+	gs_image_file3_t images[IMAGE_COUNT];
 
 	obs_weak_source_t *audio_source;
 
@@ -70,6 +74,12 @@ struct image_reaction_source {
 	float offset_x;
 	float offset_y;
 	uint32_t padding;
+
+	bool blinking;
+	float blink_timer;
+	float blink_interval_min;
+	float blink_interval_max;
+	float blink_duration;
 };
 
 /*int MAX(int a, int b) {
@@ -87,10 +97,9 @@ static const char *image_reaction_source_get_name(void *unused)
 
 static void image_reaction_source_load(struct image_reaction_source *context)
 {
-	for (int i = 0; i <= 1; i++) {
-		char *file = i == 0 ? context->file1 : context->file2;
-		gs_image_file3_t *if3 = i == 0 ? &context->if31
-					       : &context->if32;
+	for (int i = 0; i < IMAGE_COUNT; i++) {
+		char *file = context->files[i];
+		gs_image_file3_t *if3 = &context->images[i];
 
 		obs_enter_graphics();
 		gs_image_file3_free(if3);
@@ -117,8 +126,8 @@ static void image_reaction_source_load(struct image_reaction_source *context)
 static void image_reaction_source_unload(struct image_reaction_source *context)
 {
 	obs_enter_graphics();
-	gs_image_file3_free(&context->if31);
-	gs_image_file3_free(&context->if32);
+	for (int i = 0; i < IMAGE_COUNT; i++)
+		gs_image_file3_free(&context->images[i]);
 	obs_leave_graphics();
 }
 
@@ -166,8 +175,6 @@ static enum state_effect effect_from_string(const char *name)
 static void image_reaction_source_update(void *data, obs_data_t *settings)
 {
 	struct image_reaction_source *context = data;
-	const char *file1 = obs_data_get_string(settings, "file1");
-	const char *file2 = obs_data_get_string(settings, "file2");
 	const bool anim_reset_1 = obs_data_get_bool(settings, "anim_reset_1");
 	const bool anim_reset_2 = obs_data_get_bool(settings, "anim_reset_2");
 	const bool unload = obs_data_get_bool(settings, "unload");
@@ -175,13 +182,12 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 	const double threshold = obs_data_get_double(settings, "threshold");
 	const double smoothness = obs_data_get_double(settings, "smoothness");
 
-	if (context->file1)
-		bfree(context->file1);
-	context->file1 = bstrdup(file1);
-
-	if (context->file2)
-		bfree(context->file2);
-	context->file2 = bstrdup(file2);
+	for (int i = 0; i < IMAGE_COUNT; i++) {
+		if (context->files[i])
+			bfree(context->files[i]);
+		context->files[i] = bstrdup(
+			obs_data_get_string(settings, file_settings[i]));
+	}
 
 	context->animReset1 = anim_reset_1;
 	context->animReset2 = anim_reset_2;
@@ -213,6 +219,13 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 			padding = MAX(padding, context->effects[i].intensity);
 	}
 	context->padding = (uint32_t)ceilf(padding);
+
+	context->blink_interval_min =
+		(float)obs_data_get_double(settings, "blink_interval_min");
+	context->blink_interval_max =
+		(float)obs_data_get_double(settings, "blink_interval_max");
+	context->blink_duration =
+		(float)obs_data_get_double(settings, "blink_duration");
 
 	/* Load the image if the source is persistent or showing */
 	if (context->persistent || obs_source_showing(context->source))
@@ -270,6 +283,9 @@ static void image_reaction_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "effect_2", "none");
 	obs_data_set_default_double(settings, "effect_intensity_2", 10.0);
 	obs_data_set_default_double(settings, "effect_speed_2", 1.0);
+	obs_data_set_default_double(settings, "blink_interval_min", 2.0);
+	obs_data_set_default_double(settings, "blink_interval_max", 6.0);
+	obs_data_set_default_double(settings, "blink_duration", 0.15);
 }
 
 static void image_reaction_source_show(void *data)
@@ -308,11 +324,10 @@ static void image_reaction_source_destroy(void *data)
 
 	image_reaction_source_unload(context);
 
-	if (context->file1)
-		bfree(context->file1);
-
-	if (context->file2)
-		bfree(context->file2);
+	for (int i = 0; i < IMAGE_COUNT; i++) {
+		if (context->files[i])
+			bfree(context->files[i]);
+	}
 
 	/*if (context->audio_source) {
 		//obs_source_t *source = obs_weak_source_get_source(context->audio_source);
@@ -342,16 +357,18 @@ static void image_reaction_source_destroy(void *data)
 static uint32_t image_reaction_source_getwidth(void *data)
 {
 	struct image_reaction_source *context = data;
-	uint32_t cx = MAX(context->if31.image2.image.cx,
-			  context->if32.image2.image.cx);
+	uint32_t cx = 0;
+	for (int i = 0; i < IMAGE_COUNT; i++)
+		cx = MAX(cx, context->images[i].image2.image.cx);
 	return cx ? cx + context->padding * 2 : 0;
 }
 
 static uint32_t image_reaction_source_getheight(void *data)
 {
 	struct image_reaction_source *context = data;
-	uint32_t cy = MAX(context->if31.image2.image.cy,
-			  context->if32.image2.image.cy);
+	uint32_t cy = 0;
+	for (int i = 0; i < IMAGE_COUNT; i++)
+		cy = MAX(cy, context->images[i].image2.image.cy);
 	return cy ? cy + context->padding * 2 : 0;
 }
 
@@ -364,7 +381,13 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
-	gs_image_file3_t *if3 = context->loud ? &context->if32 : &context->if31;
+	/* Use the blink image if there is one for the current state */
+	int index = context->loud ? 1 : 0;
+	if (context->blinking &&
+	    context->images[index + 2].image2.image.texture)
+		index += 2;
+
+	gs_image_file3_t *if3 = &context->images[index];
 	if (if3->image2.image.texture) {
 		gs_eparam_t *const param =
 			gs_effect_get_param_by_name(effect, "image");
@@ -431,11 +454,33 @@ static void image_reaction_update_effect(struct image_reaction_source *context,
 	}
 }
 
+static void image_reaction_update_blink(struct image_reaction_source *context,
+					float seconds)
+{
+	context->blink_timer -= seconds;
+	if (context->blink_timer > 0.0f)
+		return;
+
+	if (context->blinking) {
+		/* eyes open until the next blink, after a random interval */
+		const float min = context->blink_interval_min;
+		const float max = MAX(min, context->blink_interval_max);
+		const float random = (shake_random(context) + 1.0f) * 0.5f;
+
+		context->blinking = false;
+		context->blink_timer = min + (max - min) * random;
+	} else {
+		context->blinking = true;
+		context->blink_timer = context->blink_duration;
+	}
+}
+
 static void image_reaction_tick(void *data, float seconds)
 {
 	struct image_reaction_source *context = data;
 
 	image_reaction_update_effect(context, seconds);
+	image_reaction_update_blink(context, seconds);
 
 	// Update / refresh audio capturing
 	char *new_name = NULL;
@@ -473,17 +518,18 @@ static void image_reaction_tick(void *data, float seconds)
 	uint64_t frame_time = obs_get_video_frame_time();
 	if (obs_source_active(context->source)) {
 		if (!context->active) {
-			if (context->if31.image2.image.is_animated_gif ||
-			    context->if32.image2.image.is_animated_gif)
-				context->last_time = frame_time;
+			for (int i = 0; i < IMAGE_COUNT; i++) {
+				if (context->images[i]
+					    .image2.image.is_animated_gif)
+					context->last_time = frame_time;
+			}
 			context->active = true;
 		}
 
 	} else {
 		if (context->active) {
-			for (int i = 0; i <= 1; i++) {
-				gs_image_file3_t *if3 = i == 0 ? &context->if31
-							       : &context->if32;
+			for (int i = 0; i < IMAGE_COUNT; i++) {
+				gs_image_file3_t *if3 = &context->images[i];
 				if (if3->image2.image.is_animated_gif) {
 					if3->image2.image.cur_frame = 0;
 					if3->image2.image.cur_loop = 0;
@@ -499,11 +545,10 @@ static void image_reaction_tick(void *data, float seconds)
 		}
 	}
 
-	for (int i = 0; i <= 1; i++) {
-		gs_image_file3_t *if3 = i == 0 ? &context->if31
-					       : &context->if32;
-		bool animReset = i == 0 ? context->animReset1
-					: context->animReset2;
+	for (int i = 0; i < IMAGE_COUNT; i++) {
+		gs_image_file3_t *if3 = &context->images[i];
+		bool animReset = i % 2 == 0 ? context->animReset1
+					    : context->animReset2;
 
 		if (context->last_time && if3->image2.image.is_animated_gif) {
 			if (animReset && context->animResetTrigger) {
@@ -587,6 +632,24 @@ static bool effect_changed(obs_properties_t *props, obs_property_t *prop,
 	return true;
 }
 
+static bool blink_changed(obs_properties_t *props, obs_property_t *prop,
+			  obs_data_t *settings)
+{
+	UNUSED_PARAMETER(prop);
+
+	const bool enabled =
+		*obs_data_get_string(settings, "file1_blink") != '\0' ||
+		*obs_data_get_string(settings, "file2_blink") != '\0';
+
+	obs_property_set_visible(
+		obs_properties_get(props, "blink_interval_min"), enabled);
+	obs_property_set_visible(
+		obs_properties_get(props, "blink_interval_max"), enabled);
+	obs_property_set_visible(obs_properties_get(props, "blink_duration"),
+				 enabled);
+	return true;
+}
+
 static void add_effect_properties(obs_properties_t *props, const char *effect,
 				  const char *effect_text,
 				  const char *intensity, const char *speed)
@@ -621,10 +684,10 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 
 	obs_properties_t *props = obs_properties_create();
 
-	if (s && s->file1 && *s->file1) {
+	if (s && s->files[0] && *s->files[0]) {
 		const char *slash;
 
-		dstr_copy(&path, s->file1);
+		dstr_copy(&path, s->files[0]);
 		dstr_replace(&path, "\\", "/");
 		slash = strrchr(path.array, '/');
 		if (slash)
@@ -633,17 +696,39 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 
 	obs_properties_add_path(props, "file1", obs_module_text("Reaction1"),
 				OBS_PATH_FILE, image_filter, path.array);
+	obs_property_t *p = obs_properties_add_path(props, "file1_blink",
+						    obs_module_text("Blink1"),
+						    OBS_PATH_FILE, image_filter,
+						    path.array);
+	obs_property_set_modified_callback(p, blink_changed);
 	obs_properties_add_bool(props, "anim_reset_1",
 				obs_module_text("AnimReset1"));
 	add_effect_properties(props, "effect_1", "Effect1",
 			      "effect_intensity_1", "effect_speed_1");
 	obs_properties_add_path(props, "file2", obs_module_text("Reaction2"),
 				OBS_PATH_FILE, image_filter, path.array);
+	p = obs_properties_add_path(props, "file2_blink",
+				    obs_module_text("Blink2"), OBS_PATH_FILE,
+				    image_filter, path.array);
+	obs_property_set_modified_callback(p, blink_changed);
 	obs_properties_add_bool(props, "anim_reset_2",
 				obs_module_text("AnimReset2"));
 	add_effect_properties(props, "effect_2", "Effect2",
 			      "effect_intensity_2", "effect_speed_2");
 	dstr_free(&path);
+
+	p = obs_properties_add_float_slider(props, "blink_interval_min",
+					    obs_module_text("BlinkIntervalMin"),
+					    0.5, 30.0, 0.1);
+	obs_property_float_set_suffix(p, " s");
+	p = obs_properties_add_float_slider(props, "blink_interval_max",
+					    obs_module_text("BlinkIntervalMax"),
+					    0.5, 30.0, 0.1);
+	obs_property_float_set_suffix(p, " s");
+	p = obs_properties_add_float_slider(props, "blink_duration",
+					    obs_module_text("BlinkDuration"),
+					    0.05, 1.0, 0.01);
+	obs_property_float_set_suffix(p, " s");
 
 	obs_properties_add_bool(props, "unload",
 				obs_module_text("UnloadWhenNotShowing"));
@@ -654,7 +739,7 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(sources_list, "", "");
 
-	obs_property_t *p = obs_properties_add_float_slider(
+	p = obs_properties_add_float_slider(
 		props, "threshold", obs_module_text("Threshold"), -60.0, 0.0,
 		0.1);
 	obs_property_float_set_suffix(p, " dB");
@@ -672,7 +757,10 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 uint64_t image_reaction_source_get_memory_usage(void *data)
 {
 	struct image_reaction_source *s = data;
-	return s->if31.image2.mem_usage + s->if32.image2.mem_usage;
+	uint64_t mem_usage = 0;
+	for (int i = 0; i < IMAGE_COUNT; i++)
+		mem_usage += s->images[i].image2.mem_usage;
+	return mem_usage;
 }
 
 static void missing_file_callback(void *src, const char *new_path, void *data)

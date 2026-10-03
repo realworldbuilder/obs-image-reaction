@@ -9,7 +9,7 @@ set -euo pipefail
 cd "${0:A:h}"
 
 PLUGIN_NAME="obs-image-reaction-ashmanix"
-PLUGIN_VERSION="1.1.0"
+PLUGIN_VERSION="1.2.0"
 BUNDLE_ID="com.example.${PLUGIN_NAME}"
 OBS_APP="${OBS_APP:-/Applications/OBS.app}"
 LIBOBS_FRAMEWORK="${OBS_APP}/Contents/Frameworks/libobs.framework"
